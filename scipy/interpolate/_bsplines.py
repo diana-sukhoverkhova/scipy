@@ -8,7 +8,9 @@ from scipy.linalg import (get_lapack_funcs, LinAlgError,
 from . import _bspl
 from . import _fitpack_impl
 from . import _fitpack as _dierckx
-from scipy._lib._util import prod, float_factorial
+from . import _cubic
+from scipy._lib._util import prod
+from scipy.special import poch
 from itertools import combinations
 
 __all__ = ["BSpline", "make_interp_spline", "make_lsq_spline"]
@@ -34,25 +36,11 @@ def _as_float_array(x, check_finite=False):
         raise ValueError("Array must not contain infs or nans.")
     return x
 
-def _find_left(t, x, k):
-    """
-    Returns the first index of ``t`` at which
-    ``t[i] <= x < t[i + 1]`` == True.
-    If such index can not be found returns the last index that
-    stands for the last element in initial vector of points
-    ``n + k - 2``.
-    """
-    nt = len(t)
-    for i in range(nt - 1):
-        if (t[i] <= x and t[i + 1] > x):
-            return i
-    return nt - k - 2
-
 def _dual_poly(j, k, t, y):
     """
     Dual polynomial of the B-spline B_{j,k,t} -
     polynomial which is associated with B_{j,k,t}:
-    p_{j,k}(y) = (y - t_{j+1})(y - t_{j+2})...(y - t_{j+k})
+    $p_{j,k}(y) = (y - t_{j+1})(y - t_{j+2})...(y - t_{j+k})$
     """
     if k == 0:
         return 1
@@ -60,12 +48,12 @@ def _dual_poly(j, k, t, y):
 
 def _diff_dual_poly(j, k, y, d, t):
     """
-    d-th derivative of the dual polynomial p_{j,k}(y)
+    d-th derivative of the dual polynomial $p_{j,k}(y)$
     """
     if d == 0:
         return _dual_poly(j, k, t, y)
     if d == k:
-        return float_factorial(k)
+        return poch(1, k)
     comb = list(combinations(range(j + 1, j + k + 1), d))
     res = 0
     for i in range(len(comb) * len(comb[0])):
@@ -125,7 +113,7 @@ class BSpline:
     antiderivative
     integrate
     construct_fast
-    from_cubic
+    from_power_basis
 
     Notes
     -----
@@ -602,25 +590,21 @@ class BSpline:
         return integral.reshape(ca.shape[1:])
 
     @classmethod
-    def from_cubic(cls, cb, axis=0, bc_type='natural', extrapolate=None):
-        """
+    def from_power_basis(cls, pp, bc_type='not-a-knot'):
+        r"""
         Construct a polynomial in the B-spline basis
         from a piecewise polynomial in the power basis.
+        
+        For now, accepts ``CubicSpline`` instances only.
 
         Parameters
         ----------
-        cb : CubicSpline
+        pp : CubicSpline
             A piecewise polynomial in the power basis, as created by CubicSpline
-        axis : int, optional
-            Axis along which y is assumed to be varying. Meaning that for x[i] the
-            corresponding values are np.take(y, i, axis=axis). Default is 0.
         bc_type : string, optional
-            Boundary condition type as in CubicSpline
-        extrapolate: {bool, ‘periodic’, None}, optional
-            If bool, determines whether to extrapolate to out-of-bounds points based
-            on first and last intervals, or to return NaNs. If ‘periodic’, periodic
-            extrapolation is used. If None (default), extrapolate is set to ‘periodic’
-            for bc_type='periodic' and to True otherwise.
+            Boundary condition type as in CubicSpline:
+            one of the ``not-a-knot``, ``natural``, ``clamped``, or ``periodic``
+            ``bc_type`` is needed for composition a knot vector.
 
         Returns
         -------
@@ -628,43 +612,72 @@ class BSpline:
             A new instance representing the initial polynomial in the B-spline basis.
 
         Notes
-        -----
-        The algorithm follows from differentiation the Marsden’s identity [1].
-        bc_type == 'not-a-knot' is not implemented yet.
-
+        -----        
+        The algorithm follows from differentiation the Marsden’s identity [1]:   
+        each of coefficients of spline interpolation function in B-spline basis is 
+        computed as follows:
+        
+        .. math::
+        
+            c_j = \sum_{m=0}^{k} \frac{(k-m)!}{k!} c_{m,i} (-1)^{k-m} D^m p_{j,k}(x_i)
+        
+        :math: `c_{m, i}` - a coefficient of CubicSpline,
+        :math: `D^m p_{j, k}(x_i)` - an m-th defivative of a dual polynomial in ``x_i``.
+        ``k`` always equals 3 for now.
+        
+        First ``n - 2`` coefficients are computed in ``x_i = x_j``, e.g. 
+        
+        .. math::
+        
+            c_1 = \sum_{m=0}^{k} \frac{(k-1)!}{k!} c_{m,1} D^m p_{j,3}(x_1)
+        
+        Last ``nod + 2`` coefficients are computed ``in x[-2]``, 
+        ``nod`` - number of derivatives at the ends.
+         
+        Examples
+        --------
+        Consider x = [0, 1, 2, 3, 4], y = [1, 1, 1, 1, 1] and bc_type = ``natural``
+        The coefficients of Cubic Spline in the power basis:
+        
+        [[0, 0, 0, 0, 0],
+         [0, 0, 0, 0, 0],
+         [0, 0, 0, 0, 0],
+         [1, 1, 1, 1, 1]]
+	
+        The knot vector t = [0, 0, 0, 0, 1, 2, 3, 4, 4, 4, 4]
+        In this case c[j] = 0!/k!*c_{3, i}*k! = c_{3, i} = 1 for j = 0, ..., 6
+	
         References
         ----------
+        .. versionadded:: 1.8.0
+        
         .. [1] Tom Lyche and Knut Mørken, Spline Methods, 2005, Section 3.1.2
 
         """
-        x = cb.x
-        coef = cb.c
-        k = cb.c.shape[0] - 1
+        if not isinstance(pp, _cubic.CubicSpline):
+             raise NotImplementedError("Only CubicSpline objects are accepted for now.")
+        x = pp.x
+        coef = pp.c
+        k = pp.c.shape[0] - 1
         n = x.shape[0]
-        t = np.zeros(n + 2 * k)
 
-        if bc_type == 'natural' or bc_type == 'clamped':
-            t[k: -k] = x
-            for i in range(1, k + 1):
-                t[k - i] = x[0]
-                t[n + k + i - 1] = x[-1]
+        if bc_type == 'not-a-knot':
+            t = np.r_[(x[0], )*(k + 1), x[2: -2], (x[-1], )*(k + 1)]
+        elif bc_type == 'natural' or bc_type == 'clamped':
+            t = np.r_[(x[0], )*k, x, (x[-1], )*k]
         elif bc_type == 'periodic':
             t = _periodic_knots(x, k)
+        else:
+            raise TypeError('Unknown boundary condition: %s' % bc_type)
 
-        c = np.zeros(n + 2, )
-        for i in range(n - 2):
-            mu = _find_left(t, x[i], k)
-            for m in range(k + 1):
-                c[mu - k] += coef[m, i] * np.power(-1, k - m) * _diff_dual_poly(mu - k, k, x[i], m, t) * \
-                             float_factorial(k - m) / float_factorial(k)
-
-        mu = _find_left(t, x[-2], k)
+        nod = t.shape[0] - (n + k + 1)  # number of derivatives at the ends
+        c = np.zeros(n + nod, dtype=pp.c.dtype)
         for m in range(k + 1):
-            for j in range(mu - k, mu + 1):
-                c[j] += coef[m, n - 2] * np.power(-1, k - m) * _diff_dual_poly(j, k, x[n - 2], m, t) * \
-                        float_factorial(k - m) / float_factorial(k)
-
-        return cls.construct_fast(t, c, k, extrapolate, axis)
+            for i in range(n - 2):
+                c[i] += poch(k + 1, -m) * coef[m, i] * np.power(-1, k - m) * _diff_dual_poly(i, k, x[i], m, t)
+            for j in range(n - 2, n + nod):
+                c[j] += poch(k + 1, -m) * coef[m, n - 2] * np.power(-1, k - m) * _diff_dual_poly(j, k, x[n - 2], m, t)
+        return cls.construct_fast(t, c, k, pp.extrapolate, pp.axis)
 
 
 #################################
